@@ -1,0 +1,538 @@
+/*
+ * ================================================================
+ *  D* Lite  —  Optimal Path Planning for a UGV in a Dynamic
+ *              Obstacle Environment
+ * ================================================================
+ *
+ *  Reference:
+ *    Koenig, S. & Likhachev, M. (2002). "D* Lite."
+ *    Proc. AAAI-2002, pp. 476-483.
+ *
+ *  What is D* Lite?
+ *  ─────────────────
+ *  Uniform-cost search (Dijkstra / UCS) solves shortest-path once,
+ *  assuming a static graph.  When a UGV encounters a new obstacle
+ *  (or discovers a previously-blocked cell is now clear), the whole
+ *  search must NOT be restarted from scratch — that is too slow for
+ *  real-time operation.
+ *
+ *  D* Lite maintains two cost estimates for every cell s:
+ *    g(s)   — current best known cost from START to s.
+ *    rhs(s) — one-step lookahead: min over neighbours n of
+ *             (g(n) + cost(s,n)).  This is the "right-hand side"
+ *             of the Bellman equation.
+ *
+ *  A cell is CONSISTENT when g(s) == rhs(s).
+ *  A cell is LOCALLY OVER-CONSISTENT  when g(s) >  rhs(s).
+ *  A cell is LOCALLY UNDER-CONSISTENT when g(s) <  rhs(s).
+ *
+ *  After an obstacle change, only the cells affected by the change
+ *  become inconsistent.  D* Lite re-expands ONLY those cells via a
+ *  priority queue, propagating the change lazily until consistency
+ *  is restored everywhere on the current path.
+ *
+ *  Note: D* Lite searches BACKWARD (from GOAL toward START) so that
+ *  when the UGV moves, the heuristic h(s) = distance from s to the
+ *  GOAL never needs to change.
+ *
+ *  Grid model
+ *  ───────────
+ *  • 2-D grid, 8-connected (cardinal + diagonal moves).
+ *  • Cell costs: FREE=1, DIAGONAL=1.414, OBSTACLE=INF.
+ *  • The UGV has a finite sensor range (SENSOR_RANGE cells).
+ *  • Dynamic events are injected as a scripted scenario.
+ *
+ *  Build:
+ *    gcc -Wall -O2 -lm -o dstar dstar_lite.c
+ *    ./dstar
+ * ================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+/* ─── Grid parameters ──────────────────────────────────────── */
+#define ROWS          12
+#define COLS          16
+#define SENSOR_RANGE   3          /* cells the UGV can see around it */
+#define INF           DBL_MAX/2   /* safe "infinity"                  */
+#define SQRT2         1.41421356
+
+/* ─── Cell states ──────────────────────────────────────────── */
+#define FREE       0
+#define OBSTACLE   1
+#define DYNAMIC    2              /* obstacle appeared at runtime     */
+#define CLEARED    3              /* obstacle removed at runtime      */
+
+/* ─── Key structure (priority queue key) ──────────────────── */
+typedef struct { double k1, k2; } Key;
+
+/* ─── Cell ─────────────────────────────────────────────────── */
+typedef struct {
+    double g;
+    double rhs;
+    int    state;     /* FREE / OBSTACLE / DYNAMIC / CLEARED */
+} Cell;
+
+/* ─── Priority Queue (min-heap on Key) ─────────────────────── */
+#define HEAP_CAP  (ROWS * COLS * 4)
+
+typedef struct {
+    int  row, col;
+    Key  key;
+} HeapItem;
+
+typedef struct {
+    HeapItem data[HEAP_CAP];
+    int      size;
+} PQueue;
+
+/* ─── Globals ───────────────────────────────────────────────── */
+Cell   grid[ROWS][COLS];
+int    known[ROWS][COLS];         /* 1 = UGV has sensed this cell    */
+double km;                        /* key modifier (accumulated heuristic drift) */
+
+int goal_r, goal_c;
+int start_r, start_c;
+
+PQueue pq;
+
+/* ─── Dynamic event log ─────────────────────────────────────── */
+typedef struct {
+    int step;   /* after which UGV movement step this fires  */
+    int row, col;
+    int new_state;  /* OBSTACLE or CLEARED                   */
+} DynEvent;
+
+/* Scripted scenario — obstacle pops up and one clears */
+DynEvent events[] = {
+    {2,  4, 8,  DYNAMIC},   /* step 2: new obstacle at (4,8)   */
+    {4,  6, 5,  DYNAMIC},   /* step 4: new obstacle at (6,5)   */
+    {6,  4, 8,  CLEARED},   /* step 6: obstacle at (4,8) clears */
+};
+int num_events = 3;
+
+/* ─── Key comparison ────────────────────────────────────────── */
+static inline int key_lt(Key a, Key b) {
+    return (a.k1 < b.k1 - 1e-9) ||
+           (fabs(a.k1 - b.k1) < 1e-9 && a.k2 < b.k2 - 1e-9);
+}
+
+/* ─── Heuristic h(s) = octile distance to goal ─────────────── */
+static inline double heuristic(int r, int c) {
+    int dr = abs(r - goal_r);
+    int dc = abs(c - goal_c);
+    int mn = dr < dc ? dr : dc;
+    int mx = dr > dc ? dr : dc;
+    return SQRT2 * mn + (mx - mn);
+}
+
+/* ─── Edge cost between adjacent cells ─────────────────────── */
+static double cost(int r1, int c1, int r2, int c2) {
+    if (grid[r2][c2].state == OBSTACLE || grid[r2][c2].state == DYNAMIC)
+        return INF;
+    if (r1 == r2 || c1 == c2) return 1.0;
+    return SQRT2;
+}
+
+/* ─── Priority Queue operations ─────────────────────────────── */
+static void pq_clear(void) { pq.size = 0; }
+
+static void pq_sift_up(int i) {
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (!key_lt(pq.data[i].key, pq.data[p].key)) break;
+        HeapItem t = pq.data[p]; pq.data[p] = pq.data[i]; pq.data[i] = t;
+        i = p;
+    }
+}
+
+static void pq_sift_down(int i) {
+    while (1) {
+        int l = 2*i+1, r = 2*i+2, s = i;
+        if (l < pq.size && key_lt(pq.data[l].key, pq.data[s].key)) s = l;
+        if (r < pq.size && key_lt(pq.data[r].key, pq.data[s].key)) s = r;
+        if (s == i) break;
+        HeapItem t = pq.data[s]; pq.data[s] = pq.data[i]; pq.data[i] = t;
+        i = s;
+    }
+}
+
+static void pq_push(int row, int col, Key k) {
+    /* If already present, update key if smaller */
+    for (int i = 0; i < pq.size; i++) {
+        if (pq.data[i].row == row && pq.data[i].col == col) {
+            if (key_lt(k, pq.data[i].key)) {
+                pq.data[i].key = k;
+                pq_sift_up(i);
+            }
+            return;
+        }
+    }
+    pq.data[pq.size] = (HeapItem){row, col, k};
+    pq_sift_up(pq.size++);
+}
+
+static HeapItem pq_pop(void) {
+    HeapItem top = pq.data[0];
+    pq.data[0] = pq.data[--pq.size];
+    pq_sift_down(0);
+    return top;
+}
+
+static int pq_contains(int row, int col) {
+    for (int i = 0; i < pq.size; i++)
+        if (pq.data[i].row == row && pq.data[i].col == col) return 1;
+    return 0;
+}
+
+static Key pq_top_key(void) {
+    if (pq.size == 0) return (Key){INF, INF};
+    return pq.data[0].key;
+}
+
+static void pq_remove(int row, int col) {
+    for (int i = 0; i < pq.size; i++) {
+        if (pq.data[i].row == row && pq.data[i].col == col) {
+            pq.data[i] = pq.data[--pq.size];
+            pq_sift_down(i);
+            pq_sift_up(i);
+            return;
+        }
+    }
+}
+
+/* ─── D* Lite core functions ─────────────────────────────────── */
+
+static Key calculate_key(int r, int c) {
+    double mn = grid[r][c].g < grid[r][c].rhs ? grid[r][c].g : grid[r][c].rhs;
+    return (Key){ mn + heuristic(r, c) + km, mn };
+}
+
+static void update_vertex(int r, int c) {
+    if (r == goal_r && c == goal_c) {
+        /* rhs(goal) is always 0 — never changed */
+    }
+
+    if (pq_contains(r, c)) pq_remove(r, c);
+
+    if (fabs(grid[r][c].g - grid[r][c].rhs) > 1e-9)
+        pq_push(r, c, calculate_key(r, c));
+}
+
+static int in_bounds(int r, int c) {
+    return r >= 0 && r < ROWS && c >= 0 && c < COLS;
+}
+
+/* 8-directional neighbours */
+static const int DR[8] = {-1,-1,-1, 0, 0, 1, 1, 1};
+static const int DC[8] = {-1, 0, 1,-1, 1,-1, 0, 1};
+
+/*
+ * compute_shortest_path()
+ *
+ * Expands inconsistent nodes from the priority queue until:
+ *   (a) the queue's top key >= key(start), AND
+ *   (b) start is locally consistent.
+ * This is the Dijkstra-like "process" step of D* Lite.
+ */
+static void compute_shortest_path(void) {
+    while (pq.size > 0) {
+        Key k_old = pq_top_key();
+        Key k_cur = calculate_key(start_r, start_c);
+
+        if (!key_lt(k_old, k_cur) &&
+            fabs(grid[start_r][start_c].rhs - grid[start_r][start_c].g) < 1e-9)
+            break;
+
+        HeapItem top = pq_pop();
+        int u_r = top.row, u_c = top.col;
+        Key k_new = calculate_key(u_r, u_c);
+
+        if (key_lt(k_old, k_new)) {
+            /* Key outdated — re-insert with new key */
+            pq_push(u_r, u_c, k_new);
+        } else if (grid[u_r][u_c].g > grid[u_r][u_c].rhs) {
+            /* Over-consistent: accept the cheaper rhs */
+            grid[u_r][u_c].g = grid[u_r][u_c].rhs;
+            for (int d = 0; d < 8; d++) {
+                int nr = u_r + DR[d], nc = u_c + DC[d];
+                if (!in_bounds(nr, nc)) continue;
+                double c2 = cost(nr, nc, u_r, u_c);
+                if (c2 >= INF) continue;
+                /* update rhs of neighbour from u */
+                double cand = grid[u_r][u_c].g + c2;
+                if (cand < grid[nr][nc].rhs) {
+                    grid[nr][nc].rhs = cand;
+                    update_vertex(nr, nc);
+                }
+            }
+        } else {
+            /* Under-consistent: raise g, propagate to neighbours */
+            double g_old = grid[u_r][u_c].g;
+            grid[u_r][u_c].g = INF;
+            /* Also re-check u itself in case rhs changed */
+            for (int d = 0; d < 9; d++) {
+                int nr, nc;
+                if (d == 8) { nr = u_r; nc = u_c; }
+                else        { nr = u_r + DR[d]; nc = u_c + DC[d]; }
+                if (!in_bounds(nr, nc)) continue;
+                double c2 = cost(nr, nc, u_r, u_c);
+                /* If nr relied on u for its rhs, we must recalculate */
+                if (nr == u_r && nc == u_c) {
+                    /* recalculate rhs(u) from all its neighbours */
+                    double best = (u_r == goal_r && u_c == goal_c) ? 0.0 : INF;
+                    for (int dd = 0; dd < 8; dd++) {
+                        int nnr = u_r + DR[dd], nnc = u_c + DC[dd];
+                        if (!in_bounds(nnr, nnc)) continue;
+                        double cc = cost(u_r, u_c, nnr, nnc);
+                        if (cc < INF && grid[nnr][nnc].g + cc < best)
+                            best = grid[nnr][nnc].g + cc;
+                    }
+                    grid[u_r][u_c].rhs = best;
+                    update_vertex(u_r, u_c);
+                } else {
+                    /* Did nr rely on u for its rhs? */
+                    double cand_via_u = g_old + c2;
+                    if (fabs(grid[nr][nc].rhs - cand_via_u) < 1e-9) {
+                        /* Yes — must recompute rhs(nr) from scratch */
+                        double best = (nr == goal_r && nc == goal_c) ? 0.0 : INF;
+                        for (int dd = 0; dd < 8; dd++) {
+                            int nnr = nr + DR[dd], nnc = nc + DC[dd];
+                            if (!in_bounds(nnr, nnc)) continue;
+                            double cc = cost(nr, nc, nnr, nnc);
+                            if (cc < INF && grid[nnr][nnc].g + cc < best)
+                                best = grid[nnr][nnc].g + cc;
+                        }
+                        grid[nr][nc].rhs = best;
+                        update_vertex(nr, nc);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ─── Sensor: mark cells within range as known ──────────────── */
+static int sense_environment(int ugv_r, int ugv_c, int *changed) {
+    *changed = 0;
+    for (int dr = -SENSOR_RANGE; dr <= SENSOR_RANGE; dr++) {
+        for (int dc = -SENSOR_RANGE; dc <= SENSOR_RANGE; dc++) {
+            int nr = ugv_r + dr, nc = ugv_c + dc;
+            if (!in_bounds(nr, nc)) continue;
+            if (known[nr][nc]) continue;
+            known[nr][nc] = 1;
+            /* If this cell is actually an obstacle that was not known, flag it */
+            if (grid[nr][nc].state == DYNAMIC) {
+                *changed = 1;
+            }
+        }
+    }
+    return *changed;
+}
+
+/* ─── Apply dynamic event ────────────────────────────────────── */
+static void apply_event(DynEvent *ev) {
+    if (ev->new_state == OBSTACLE || ev->new_state == DYNAMIC) {
+        grid[ev->row][ev->col].state = DYNAMIC;
+        printf("  [EVENT] New obstacle at (%d,%d)\n", ev->row, ev->col);
+    } else if (ev->new_state == CLEARED) {
+        grid[ev->row][ev->col].state = FREE;
+        printf("  [EVENT] Obstacle cleared at (%d,%d)\n", ev->row, ev->col);
+    }
+}
+
+/*
+ * replan()
+ *
+ * Called whenever the UGV senses a change.
+ * For each changed edge (u,v):
+ *   1. Update the edge cost in the graph.
+ *   2. For each node u that used v in its shortest path, recompute
+ *      rhs(u) and push u back into the priority queue if inconsistent.
+ * Then call compute_shortest_path() to restore consistency.
+ */
+static void replan(int ugv_r, int ugv_c) {
+    km += heuristic(ugv_r, ugv_c);  /* key modifier update */
+
+    /* Scan all sensed cells and propagate changes */
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            if (!known[r][c]) continue;
+            /* Recompute rhs for this cell from all its neighbours */
+            double best = (r == goal_r && c == goal_c) ? 0.0 : INF;
+            for (int d = 0; d < 8; d++) {
+                int nr = r + DR[d], nc = c + DC[d];
+                if (!in_bounds(nr, nc)) continue;
+                double c2 = cost(r, c, nr, nc);
+                if (c2 < INF && grid[nr][nc].g + c2 < best)
+                    best = grid[nr][nc].g + c2;
+            }
+            if (fabs(best - grid[r][c].rhs) > 1e-9) {
+                grid[r][c].rhs = best;
+                update_vertex(r, c);
+            }
+        }
+    }
+    compute_shortest_path();
+}
+
+/* ─── Navigation: pick best neighbour ───────────────────────── */
+static int next_step(int r, int c, int *nr_out, int *nc_out) {
+    double best = INF;
+    int br = -1, bc = -1;
+    for (int d = 0; d < 8; d++) {
+        int nr = r + DR[d], nc = c + DC[d];
+        if (!in_bounds(nr, nc)) continue;
+        double c2 = cost(r, c, nr, nc);
+        if (c2 >= INF) continue;
+        double cand = grid[nr][nc].g + c2;
+        if (cand < best) { best = cand; br = nr; bc = nc; }
+    }
+    *nr_out = br; *nc_out = bc;
+    return (br != -1);
+}
+
+/* ─── Display ────────────────────────────────────────────────── */
+static void display(int path_r[], int path_c[], int path_len,
+                    int ugv_r, int ugv_c) {
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            int on_path = 0;
+            for (int k = 0; k < path_len; k++)
+                if (path_r[k] == r && path_c[k] == c) { on_path = 1; break; }
+
+            if      (r == ugv_r  && c == ugv_c)                   printf("U ");
+            else if (r == goal_r && c == goal_c)                   printf("G ");
+            else if (r == start_r && c == start_c)                printf("S ");
+            else if (grid[r][c].state == OBSTACLE)                 printf("# ");
+            else if (grid[r][c].state == DYNAMIC && known[r][c])  printf("X ");
+            else if (grid[r][c].state == DYNAMIC && !known[r][c]) printf(". ");
+            else if (on_path && known[r][c])                       printf("* ");
+            else if (known[r][c])                                  printf(". ");
+            else                                                   printf("? ");
+        }
+        printf("\n");
+    }
+    printf("  U=UGV  G=Goal  S=Start  #=Static obstacle  "
+           "X=Dynamic obstacle  *=Planned path  ?=Unknown\n\n");
+}
+
+/* ─── Initialization ─────────────────────────────────────────── */
+static void init_grid(void) {
+    for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+            grid[r][c].g     = INF;
+            grid[r][c].rhs   = INF;
+            grid[r][c].state = FREE;
+            known[r][c]      = 0;
+        }
+
+    /* Static obstacle walls */
+    int walls[][2] = {
+        {1,3},{2,3},{3,3},{4,3},{5,3},           /* vertical wall left  */
+        {3,7},{3,8},{3,9},{3,10},{3,11},          /* horizontal wall mid */
+        {6,9},{7,9},{8,9},{9,9},                  /* vertical wall right */
+        {7,4},{7,5},{7,6},{7,7},                  /* horizontal wall low */
+    };
+    for (int i = 0; i < (int)(sizeof(walls)/sizeof(walls[0])); i++)
+        grid[walls[i][0]][walls[i][1]].state = OBSTACLE;
+}
+
+/* ─── Main ───────────────────────────────────────────────────── */
+int main(void) {
+    /* Start: top-left area; Goal: bottom-right area */
+    start_r = 1; start_c = 1;
+    goal_r  = 10; goal_c = 14;
+
+    init_grid();
+    pq_clear();
+    km = 0.0;
+
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║  D* Lite — UGV Navigation in Dynamic Environment    ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n\n");
+
+    /* ── Phase 1: Initial backward Dijkstra from goal ── */
+    grid[goal_r][goal_c].rhs = 0.0;
+    pq_push(goal_r, goal_c, calculate_key(goal_r, goal_c));
+
+    /* Mark start region as known so initial plan is valid */
+    for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++)
+            known[r][c] = (grid[r][c].state == OBSTACLE) ? 1 : 0;
+
+    compute_shortest_path();
+
+    /* Check reachability */
+    if (grid[start_r][start_c].g >= INF) {
+        printf("No path found from start to goal!\n");
+        return 1;
+    }
+
+    printf("Initial plan computed (backward Dijkstra from Goal).\n");
+    printf("Start (%d,%d) → Goal (%d,%d), cost = %.2f\n\n",
+           start_r, start_c, goal_r, goal_c,
+           grid[start_r][start_c].g);
+
+    /* ── Phase 2: UGV moves along path ── */
+    int ugv_r = start_r, ugv_c = start_c;
+    int step = 0;
+    int max_steps = ROWS * COLS;   /* safety bound */
+
+    int path_r[ROWS*COLS], path_c[ROWS*COLS];
+
+    while ((ugv_r != goal_r || ugv_c != goal_c) && step < max_steps) {
+        printf("─── Step %d ───  UGV at (%d,%d), g=%.2f\n",
+               step, ugv_r, ugv_c, grid[ugv_r][ugv_c].g);
+
+        /* Inject dynamic events for this step */
+        for (int e = 0; e < num_events; e++)
+            if (events[e].step == step) apply_event(&events[e]);
+
+        /* Sense environment and replan if needed */
+        int changed;
+        sense_environment(ugv_r, ugv_c, &changed);
+        if (changed) {
+            printf("  Obstacle sensed! Replanning...\n");
+            replan(ugv_r, ugv_c);
+            if (grid[ugv_r][ugv_c].g >= INF) {
+                printf("  No path exists! UGV is stuck.\n");
+                break;
+            }
+            printf("  Replan complete. New cost to goal = %.2f\n",
+                   grid[ugv_r][ugv_c].g);
+        }
+
+        /* Build current path for display */
+        int pr = ugv_r, pc = ugv_c, plen = 0;
+        while ((pr != goal_r || pc != goal_c) && plen < ROWS*COLS) {
+            path_r[plen] = pr; path_c[plen] = pc; plen++;
+            int nr2, nc2;
+            if (!next_step(pr, pc, &nr2, &nc2)) break;
+            pr = nr2; pc = nc2;
+        }
+        path_r[plen] = goal_r; path_c[plen] = goal_c; plen++;
+
+        display(path_r, path_c, plen, ugv_r, ugv_c);
+
+        /* Move one step */
+        int nr, nc;
+        if (!next_step(ugv_r, ugv_c, &nr, &nc)) {
+            printf("No valid move available!\n");
+            break;
+        }
+        ugv_r = nr; ugv_c = nc;
+        step++;
+    }
+
+    if (ugv_r == goal_r && ugv_c == goal_c)
+        printf("✓ UGV reached the goal in %d steps.\n\n", step);
+    else
+        printf("✗ UGV did not reach goal.\n\n");
+
+    return 0;
+}
