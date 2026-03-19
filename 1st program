@@ -1,0 +1,305 @@
+/*
+ * ============================================================
+ *  Dijkstra's Algorithm (Uniform-Cost Search) on the
+ *  Indian Road Network – 20 Major Cities
+ * ============================================================
+ *
+ *  Road distances (km) are taken from publicly available
+ *  sources (Maps of India, Google Maps, Indiastat).
+ *  They represent approximate highway distances and may
+ *  differ slightly from real-time route planners.
+ *
+ *  Implementation uses a MIN-HEAP (binary heap) as the
+ *  priority queue for O((V + E) log V) overall complexity.
+ *
+ *  Usage:
+ *      gcc -Wall -O2 -o dijkstra dijkstra_india.c
+ *      ./dijkstra
+ * ============================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+
+/* ── Constants ─────────────────────────────────────────── */
+#define MAX_CITIES   20
+#define MAX_EDGES    100          /* upper bound per city    */
+#define INF          INT_MAX
+
+/* ── City index enumeration ─────────────────────────────── */
+typedef enum {
+    DELHI = 0, MUMBAI, KOLKATA, CHENNAI, BENGALURU,
+    HYDERABAD, AHMEDABAD, PUNE, JAIPUR, LUCKNOW,
+    KANPUR, NAGPUR, INDORE, BHOPAL, PATNA,
+    BHUBANESWAR, VISAKHAPATNAM, KOCHI, AMRITSAR, SURAT
+} City;
+
+/* ── City names ─────────────────────────────────────────── */
+const char *city_name[MAX_CITIES] = {
+    "Delhi",       "Mumbai",       "Kolkata",      "Chennai",
+    "Bengaluru",   "Hyderabad",    "Ahmedabad",    "Pune",
+    "Jaipur",      "Lucknow",      "Kanpur",       "Nagpur",
+    "Indore",      "Bhopal",       "Patna",        "Bhubaneswar",
+    "Visakhapatnam","Kochi",       "Amritsar",     "Surat"
+};
+
+/* ── Graph structures ───────────────────────────────────── */
+typedef struct {
+    int to;
+    int dist;
+} Edge;
+
+typedef struct {
+    Edge edges[MAX_EDGES];
+    int  count;
+} AdjList;
+
+AdjList graph[MAX_CITIES];
+
+/* ── Min-Heap (Priority Queue) ──────────────────────────── */
+typedef struct {
+    int city;
+    int cost;
+} HeapNode;
+
+typedef struct {
+    HeapNode data[MAX_CITIES * MAX_CITIES];
+    int      size;
+} MinHeap;
+
+/* ── Graph helpers ──────────────────────────────────────── */
+void add_edge(int u, int v, int d)
+{
+    /* undirected: insert both directions */
+    graph[u].edges[graph[u].count++] = (Edge){v, d};
+    graph[v].edges[graph[v].count++] = (Edge){u, d};
+}
+
+/* ── Heap helpers ───────────────────────────────────────── */
+void heap_push(MinHeap *h, int city, int cost)
+{
+    int i = h->size++;
+    h->data[i] = (HeapNode){city, cost};
+    /* sift up */
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (h->data[parent].cost <= h->data[i].cost) break;
+        HeapNode tmp     = h->data[parent];
+        h->data[parent]  = h->data[i];
+        h->data[i]       = tmp;
+        i = parent;
+    }
+}
+
+HeapNode heap_pop(MinHeap *h)
+{
+    HeapNode top = h->data[0];
+    h->data[0]   = h->data[--h->size];
+    /* sift down */
+    int i = 0;
+    while (1) {
+        int l = 2*i+1, r = 2*i+2, smallest = i;
+        if (l < h->size && h->data[l].cost < h->data[smallest].cost) smallest = l;
+        if (r < h->size && h->data[r].cost < h->data[smallest].cost) smallest = r;
+        if (smallest == i) break;
+        HeapNode tmp       = h->data[smallest];
+        h->data[smallest]  = h->data[i];
+        h->data[i]         = tmp;
+        i = smallest;
+    }
+    return top;
+}
+
+/* ── Dijkstra ───────────────────────────────────────────── */
+/*
+ * Runs Dijkstra from `src` and fills:
+ *   dist[]  – shortest distance from src to every city
+ *   prev[]  – predecessor on shortest path (for reconstruction)
+ */
+void dijkstra(int src, int dist[], int prev[])
+{
+    int visited[MAX_CITIES] = {0};
+
+    for (int i = 0; i < MAX_CITIES; i++) {
+        dist[i] = INF;
+        prev[i] = -1;
+    }
+    dist[src] = 0;
+
+    MinHeap pq = {.size = 0};
+    heap_push(&pq, src, 0);
+
+    while (pq.size > 0) {
+        HeapNode cur = heap_pop(&pq);
+        int u = cur.city;
+
+        if (visited[u]) continue;
+        visited[u] = 1;
+
+        for (int i = 0; i < graph[u].count; i++) {
+            int v    = graph[u].edges[i].to;
+            int w    = graph[u].edges[i].dist;
+            if (!visited[v] && dist[u] != INF && dist[u] + w < dist[v]) {
+                dist[v] = dist[u] + w;
+                prev[v] = u;
+                heap_push(&pq, v, dist[v]);
+            }
+        }
+    }
+}
+
+/* ── Path reconstruction ────────────────────────────────── */
+void print_path(int prev[], int dest)
+{
+    if (dest == -1) return;
+    if (prev[dest] == -1) {
+        printf("%s", city_name[dest]);
+        return;
+    }
+    print_path(prev, prev[dest]);
+    printf(" → %s", city_name[dest]);
+}
+
+/* ── Build the road network ─────────────────────────────── */
+/*
+ * Sources: Maps of India (mapsofindia.com), Google Maps,
+ *          Indiastat, and publicly available road distance
+ *          charts (approximate highway distances, km).
+ *
+ * Only direct / near-direct highway links are encoded;
+ * indirect distances are computed by the algorithm.
+ */
+void build_graph(void)
+{
+    memset(graph, 0, sizeof(graph));
+
+    /* ── North ──────────────────────────────────────────── */
+    add_edge(DELHI,      JAIPUR,      281);
+    add_edge(DELHI,      LUCKNOW,     555);
+    add_edge(DELHI,      KANPUR,      480);
+    add_edge(DELHI,      AMRITSAR,    449);
+    add_edge(DELHI,      MUMBAI,     1422);
+    add_edge(DELHI,      AHMEDABAD,  944);
+    add_edge(DELHI,      BHOPAL,      777);
+    add_edge(DELHI,      PATNA,       1000);
+
+    /* ── North-West ─────────────────────────────────────── */
+    add_edge(JAIPUR,     AHMEDABAD,   670);
+    add_edge(JAIPUR,     INDORE,      496);
+    add_edge(JAIPUR,     BHOPAL,      564);
+    add_edge(AMRITSAR,   DELHI,       449);   /* duplicate safe */
+
+    /* ── Central / West ─────────────────────────────────── */
+    add_edge(AHMEDABAD,  MUMBAI,      524);
+    add_edge(AHMEDABAD,  SURAT,       264);
+    add_edge(AHMEDABAD,  INDORE,      390);
+    add_edge(SURAT,      MUMBAI,      285);
+    add_edge(SURAT,      PUNE,        390);
+    add_edge(MUMBAI,     PUNE,        149);
+    add_edge(MUMBAI,     NAGPUR,      833);
+    add_edge(MUMBAI,     HYDERABAD,  711);
+    add_edge(PUNE,       HYDERABAD,   559);
+    add_edge(PUNE,       BENGALURU,   836);
+    add_edge(INDORE,     BHOPAL,      195);
+    add_edge(INDORE,     NAGPUR,      476);
+    add_edge(BHOPAL,     NAGPUR,      358);
+    add_edge(BHOPAL,     LUCKNOW,     600);
+    add_edge(BHOPAL,     PATNA,       1046);  /* via Allahabad */
+
+    /* ── East ───────────────────────────────────────────── */
+    add_edge(LUCKNOW,    KANPUR,       82);
+    add_edge(LUCKNOW,    PATNA,        531);
+    add_edge(KANPUR,     PATNA,        565);
+    add_edge(PATNA,      KOLKATA,      600);
+    add_edge(PATNA,      BHUBANESWAR,  820);
+    add_edge(KOLKATA,    BHUBANESWAR,  474);
+    add_edge(KOLKATA,    VISAKHAPATNAM,1050);
+    add_edge(BHUBANESWAR,VISAKHAPATNAM,445);
+
+    /* ── South ──────────────────────────────────────────── */
+    add_edge(HYDERABAD,  BENGALURU,    575);
+    add_edge(HYDERABAD,  CHENNAI,      627);
+    add_edge(HYDERABAD,  NAGPUR,       505);
+    add_edge(HYDERABAD,  VISAKHAPATNAM,625);
+    add_edge(BENGALURU,  CHENNAI,      347);
+    add_edge(BENGALURU,  KOCHI,        544);
+    add_edge(CHENNAI,    KOCHI,        690);
+    add_edge(CHENNAI,    VISAKHAPATNAM,790);
+    add_edge(VISAKHAPATNAM, KOCHI,    1273);  /* via Chennai   */
+    add_edge(NAGPUR,     KOLKATA,      1060);
+}
+
+/* ── Display helpers ────────────────────────────────────── */
+void print_separator(void) {
+    printf("─────────────────────────────────────────────────────────\n");
+}
+
+void print_results(int src, int dist[], int prev[])
+{
+    printf("\n");
+    print_separator();
+    printf("  Shortest road distances from  %-15s (km)\n", city_name[src]);
+    print_separator();
+    printf("  %-20s  %8s   %-s\n", "Destination", "Dist(km)", "Path");
+    print_separator();
+
+    for (int i = 0; i < MAX_CITIES; i++) {
+        if (i == src) continue;
+        if (dist[i] == INF) {
+            printf("  %-20s  %8s   (unreachable)\n", city_name[i], "∞");
+        } else {
+            printf("  %-20s  %8d   ", city_name[i], dist[i]);
+            print_path(prev, i);
+            printf("\n");
+        }
+    }
+    print_separator();
+}
+
+/* ── Main ───────────────────────────────────────────────── */
+int main(void)
+{
+    build_graph();
+
+    int dist[MAX_CITIES];
+    int prev[MAX_CITIES];
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║   Dijkstra's Algorithm – Indian Road Network         ║\n");
+    printf("║   Uniform-Cost Search (Best-First, f(n) = g(n))      ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n");
+
+    /* ── Run from Delhi ──────────────────────────────────── */
+    dijkstra(DELHI, dist, prev);
+    print_results(DELHI, dist, prev);
+
+    /* ── Run from Mumbai ─────────────────────────────────── */
+    dijkstra(MUMBAI, dist, prev);
+    print_results(MUMBAI, dist, prev);
+
+    /* ── Run from Chennai ────────────────────────────────── */
+    dijkstra(CHENNAI, dist, prev);
+    print_results(CHENNAI, dist, prev);
+
+    /* ── Run from Kolkata ────────────────────────────────── */
+    dijkstra(KOLKATA, dist, prev);
+    print_results(KOLKATA, dist, prev);
+
+    /* ── Demonstrate a single point-to-point query ────────── */
+    printf("\n");
+    print_separator();
+    printf("  Point-to-Point: Amritsar → Kochi\n");
+    print_separator();
+    dijkstra(AMRITSAR, dist, prev);
+    printf("  Distance : %d km\n", dist[KOCHI]);
+    printf("  Path     : ");
+    print_path(prev, KOCHI);
+    printf("\n");
+    print_separator();
+    printf("\n");
+
+    return 0;
+}
