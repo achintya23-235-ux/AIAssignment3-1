@@ -1,0 +1,555 @@
+/*
+ * ================================================================
+ *  UGV BATTLEFIELD PATH PLANNER
+ *  Algorithm : A* Search  (f = g + h,  h = Octile / Chebyshev)
+ *  Grid      : 70 x 70 km  →  represented as N x N cells
+ *              Each cell = 1 km²
+ *  Movement  : 8-directional (cardinal + diagonal)
+ *  Obstacles : Three density levels  LOW / MEDIUM / HIGH
+ *              generated pseudo-randomly with a user seed
+ *
+ *  Measures of Effectiveness (MoE) reported:
+ *    1. Path length (km)
+ *    2. Nodes expanded (search effort)
+ *    3. Nodes generated (memory touched)
+ *    4. Branching factor (effective)
+ *    5. CPU time (ms)
+ *    6. Memory used by open + closed lists (KB)
+ *    7. Path straightness ratio
+ *    8. Obstacle avoidance events
+ *
+ *  Compile :  gcc -Wall -O2 -lm -o ugv ugv_astar.c
+ *  Run     :  ./ugv
+ * ================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <stdint.h>
+
+/* ── Grid parameters ─────────────────────────────────────── */
+#define GRID_N        70          /* 70 x 70 km                */
+#define CELL_KM       1.0         /* each cell = 1 km          */
+#define MAX_CELLS     (GRID_N * GRID_N)   /* 4900               */
+
+/* ── Cell state flags ────────────────────────────────────── */
+#define FREE          0
+#define OBSTACLE      1
+
+/* ── Obstacle density (fraction of total cells) ──────────── */
+#define DENSITY_LOW    0.10       /* 10 %                      */
+#define DENSITY_MEDIUM 0.25       /* 25 %                      */
+#define DENSITY_HIGH   0.40       /* 40 %                      */
+
+/* ── Movement cost ────────────────────────────────────────── */
+#define MOVE_CARDINAL  1.000      /* straight  (km)            */
+#define MOVE_DIAGONAL  1.4142135  /* √2 (km)                   */
+
+/* ── A* node ──────────────────────────────────────────────── */
+typedef struct {
+    float g;          /* cost from start                       */
+    float h;          /* heuristic to goal                     */
+    float f;          /* f = g + h                             */
+    int   parent;     /* parent cell index, -1 if none         */
+    int8_t in_open;   /* 1 = currently in open list            */
+    int8_t in_closed; /* 1 = already expanded                  */
+} AStarNode;
+
+/* ── Grid ─────────────────────────────────────────────────── */
+typedef struct {
+    uint8_t    cell[GRID_N][GRID_N]; /* FREE / OBSTACLE         */
+    AStarNode  node[MAX_CELLS];
+    int        open_heap[MAX_CELLS]; /* min-heap of cell indices */
+    int        heap_size;
+} Grid;
+
+/* ── Statistics / MoE ─────────────────────────────────────── */
+typedef struct {
+    int    nodes_expanded;
+    int    nodes_generated;
+    int    path_length_cells;
+    double path_length_km;
+    double straightline_km;
+    double straightness_ratio;
+    int    obstacle_avoidance_events;
+    double cpu_time_ms;
+    double memory_kb;
+    double effective_branching;
+} MoE;
+
+/* ── Globals (static allocation to avoid stack overflow) ──── */
+static Grid G;
+
+/* ═══════════════════════════════════════════════════════════
+ *  Utility: row/col ↔ flat index
+ * ═══════════════════════════════════════════════════════════ */
+static inline int idx(int r, int c)       { return r * GRID_N + c; }
+static inline int row(int i)              { return i / GRID_N;      }
+static inline int col(int i)              { return i % GRID_N;      }
+static inline int in_bounds(int r, int c) { return r>=0 && r<GRID_N && c>=0 && c<GRID_N; }
+
+/* ═══════════════════════════════════════════════════════════
+ *  Min-Heap (open list)
+ * ═══════════════════════════════════════════════════════════ */
+static void heap_swap(int a, int b)
+{
+    int tmp = G.open_heap[a];
+    G.open_heap[a] = G.open_heap[b];
+    G.open_heap[b] = tmp;
+}
+static void sift_up(int i)
+{
+    while (i > 0) {
+        int p = (i-1)/2;
+        if (G.node[G.open_heap[p]].f <= G.node[G.open_heap[i]].f) break;
+        heap_swap(p, i);
+        i = p;
+    }
+}
+static void sift_down(int i)
+{
+    while (1) {
+        int l=2*i+1, r=2*i+2, s=i;
+        if (l<G.heap_size && G.node[G.open_heap[l]].f < G.node[G.open_heap[s]].f) s=l;
+        if (r<G.heap_size && G.node[G.open_heap[r]].f < G.node[G.open_heap[s]].f) s=r;
+        if (s==i) break;
+        heap_swap(s,i);
+        i=s;
+    }
+}
+static void heap_push(int cell_idx)
+{
+    G.open_heap[G.heap_size++] = cell_idx;
+    sift_up(G.heap_size - 1);
+}
+static int heap_pop(void)
+{
+    int top = G.open_heap[0];
+    G.open_heap[0] = G.open_heap[--G.heap_size];
+    if (G.heap_size > 0) sift_down(0);
+    return top;
+}
+/* decrease-key: re-push; stale copies skipped via in_closed */
+static void heap_decrease_key(int cell_idx)
+{
+    /* linear scan – acceptable for N=70 */
+    for (int i = 0; i < G.heap_size; i++) {
+        if (G.open_heap[i] == cell_idx) {
+            sift_up(i);
+            sift_down(i);
+            return;
+        }
+    }
+    heap_push(cell_idx);
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Heuristic: Octile distance (exact for 8-dir uniform grid)
+ * ═══════════════════════════════════════════════════════════ */
+static float octile(int r1, int c1, int r2, int c2)
+{
+    float dr = (float)abs(r1-r2);
+    float dc = (float)abs(c1-c2);
+    float mn = dr<dc ? dr : dc;
+    float mx = dr>dc ? dr : dc;
+    return (float)MOVE_DIAGONAL * mn + (mx - mn);
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Generate obstacle field
+ * ═══════════════════════════════════════════════════════════ */
+static void generate_obstacles(double density, int sr, int sc, int gr, int gc,
+                                unsigned int seed)
+{
+    srand(seed);
+    memset(G.cell, FREE, sizeof(G.cell));
+    int total   = GRID_N * GRID_N;
+    int n_obs   = (int)(density * total);
+
+    /* Place obstacles randomly, never on start or goal */
+    int placed = 0;
+    while (placed < n_obs) {
+        int r = rand() % GRID_N;
+        int c = rand() % GRID_N;
+        if (G.cell[r][c] == OBSTACLE) continue;
+        if (r==sr && c==sc) continue;
+        if (r==gr && c==gc) continue;
+        G.cell[r][c] = OBSTACLE;
+        placed++;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  A* Search
+ *  Returns 1 if path found, 0 if unreachable.
+ * ═══════════════════════════════════════════════════════════ */
+static int astar(int sr, int sc, int gr, int gc, MoE *moe)
+{
+    /* 8-directional neighbourhood */
+    const int dr[] = {-1,-1,-1, 0, 0, 1, 1, 1};
+    const int dc[] = {-1, 0, 1,-1, 1,-1, 0, 1};
+
+    /* Initialise all nodes */
+    for (int i = 0; i < MAX_CELLS; i++) {
+        G.node[i].g = G.node[i].h = G.node[i].f = 1e30f;
+        G.node[i].parent     = -1;
+        G.node[i].in_open    =  0;
+        G.node[i].in_closed  =  0;
+    }
+
+    G.heap_size = 0;
+    moe->nodes_expanded  = 0;
+    moe->nodes_generated = 0;
+
+    int start = idx(sr,sc);
+    int goal  = idx(gr,gc);
+
+    G.node[start].g = 0;
+    G.node[start].h = octile(sr,sc,gr,gc);
+    G.node[start].f = G.node[start].h;
+    G.node[start].in_open = 1;
+    heap_push(start);
+    moe->nodes_generated++;
+
+    while (G.heap_size > 0) {
+        int cur = heap_pop();
+        if (G.node[cur].in_closed) continue;   /* stale copy */
+        G.node[cur].in_open   = 0;
+        G.node[cur].in_closed = 1;
+        moe->nodes_expanded++;
+
+        if (cur == goal) return 1;   /* ── FOUND ── */
+
+        int r = row(cur), c = col(cur);
+
+        for (int d = 0; d < 8; d++) {
+            int nr = r + dr[d];
+            int nc = c + dc[d];
+            if (!in_bounds(nr,nc))              continue;
+            if (G.cell[nr][nc] == OBSTACLE)     continue;
+
+            /* Diagonal move legality:
+               block if both shared cardinal neighbours are obstacles
+               (prevents cutting through obstacle corners) */
+            if (dr[d] != 0 && dc[d] != 0) {
+                if (G.cell[r][nc] == OBSTACLE && G.cell[nr][c] == OBSTACLE)
+                    continue;
+            }
+
+            int nb = idx(nr,nc);
+            if (G.node[nb].in_closed) continue;
+
+            float move_cost = (dr[d]!=0 && dc[d]!=0)
+                              ? (float)MOVE_DIAGONAL : (float)MOVE_CARDINAL;
+            float new_g = G.node[cur].g + move_cost;
+
+            if (new_g < G.node[nb].g) {
+                G.node[nb].g      = new_g;
+                G.node[nb].h      = octile(nr,nc,gr,gc);
+                G.node[nb].f      = new_g + G.node[nb].h;
+                G.node[nb].parent = cur;
+
+                if (!G.node[nb].in_open) {
+                    G.node[nb].in_open = 1;
+                    heap_push(nb);
+                    moe->nodes_generated++;
+                } else {
+                    heap_decrease_key(nb);
+                }
+            }
+        }
+    }
+    return 0;   /* unreachable */
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Reconstruct path and compute MoEs
+ * ═══════════════════════════════════════════════════════════ */
+/* path[] : cell indices from goal back to start (reversed) */
+static int path_buf[MAX_CELLS];
+
+static int reconstruct_path(int goal)
+{
+    int len = 0;
+    int cur = goal;
+    while (cur != -1) {
+        path_buf[len++] = cur;
+        cur = G.node[cur].parent;
+    }
+    /* reverse in place */
+    for (int i=0,j=len-1; i<j; i++,j--) {
+        int t = path_buf[i]; path_buf[i]=path_buf[j]; path_buf[j]=t;
+    }
+    return len;
+}
+
+static void compute_moe(int sr, int sc, int gr, int gc,
+                        int path_len, MoE *moe,
+                        clock_t t_start, clock_t t_end)
+{
+    /* Path length in km */
+    double path_km = 0.0;
+    for (int i = 1; i < path_len; i++) {
+        int pr = row(path_buf[i-1]), pc = col(path_buf[i-1]);
+        int cr = row(path_buf[i]),   cc = col(path_buf[i]);
+        int dr = abs(pr-cr), dc = abs(pc-cc);
+        path_km += (dr && dc) ? MOVE_DIAGONAL : MOVE_CARDINAL;
+    }
+    moe->path_length_cells = path_len;
+    moe->path_length_km    = path_km;
+
+    /* Straight-line distance */
+    double dx = (gc - sc) * CELL_KM;
+    double dy = (gr - sr) * CELL_KM;
+    moe->straightline_km   = sqrt(dx*dx + dy*dy);
+    moe->straightness_ratio = (moe->straightline_km > 0)
+                              ? moe->straightline_km / path_km : 1.0;
+
+    /* Obstacle avoidance events: direction changes caused by obstacle proximity */
+    int avoidance = 0;
+    for (int i = 1; i < path_len - 1; i++) {
+        int pr = row(path_buf[i-1]), pc = col(path_buf[i-1]);
+        int cr = row(path_buf[i]),   cc = col(path_buf[i]);
+        int nr = row(path_buf[i+1]), nc = col(path_buf[i+1]);
+        /* direction change */
+        if ((nr-cr) != (cr-pr) || (nc-cc) != (cc-pc)) {
+            /* check if an obstacle neighbour forced the turn */
+            int forced = 0;
+            for (int dd=-1; dd<=1 && !forced; dd++)
+                for (int ee=-1; ee<=1 && !forced; ee++) {
+                    if (!dd && !ee) continue;
+                    int rr=cr+dd, cc2=cc+ee;
+                    if (in_bounds(rr,cc2) && G.cell[rr][cc2]==OBSTACLE) forced=1;
+                }
+            if (forced) avoidance++;
+        }
+    }
+    moe->obstacle_avoidance_events = avoidance;
+
+    /* CPU time */
+    moe->cpu_time_ms = 1000.0 * (double)(t_end - t_start) / CLOCKS_PER_SEC;
+
+    /* Memory: open + closed lists (node array) */
+    moe->memory_kb = (double)(MAX_CELLS * sizeof(AStarNode)) / 1024.0;
+
+    /* Effective branching factor approximation */
+    moe->effective_branching = (moe->nodes_expanded > 1)
+        ? pow((double)moe->nodes_expanded, 1.0/path_len)
+        : 1.0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  ASCII map renderer
+ * ═══════════════════════════════════════════════════════════ */
+/* Marks used in the display */
+#define MARK_FREE     '.'
+#define MARK_OBS      '#'
+#define MARK_PATH     '*'
+#define MARK_START    'S'
+#define MARK_GOAL     'G'
+
+static void render_map(int sr, int sc, int gr, int gc, int path_len,
+                       int full)
+{
+    /* Build display buffer */
+    char disp[GRID_N][GRID_N];
+    for (int r=0; r<GRID_N; r++)
+        for (int c=0; c<GRID_N; c++)
+            disp[r][c] = G.cell[r][c] ? MARK_OBS : MARK_FREE;
+
+    /* Mark path */
+    for (int i=0; i<path_len; i++) {
+        int r=row(path_buf[i]), c=col(path_buf[i]);
+        disp[r][c] = MARK_PATH;
+    }
+    disp[sr][sc] = MARK_START;
+    disp[gr][gc] = MARK_GOAL;
+
+    if (!full) {
+        /* Print a zoomed sub-window of ~40x40 centred on path midpoint */
+        int mr = row(path_buf[path_len/2]);
+        int mc = col(path_buf[path_len/2]);
+        int r0 = mr-20; if (r0<0) r0=0;
+        int c0 = mc-20; if (c0<0) c0=0;
+        int r1 = r0+40; if (r1>GRID_N) { r1=GRID_N; r0=r1-40; if(r0<0)r0=0; }
+        int c1 = c0+40; if (c1>GRID_N) { c1=GRID_N; c0=c1-40; if(c0<0)c0=0; }
+
+        printf("\n  [Map zoomed to rows %d-%d, cols %d-%d]\n", r0,r1-1,c0,c1-1);
+        printf("  +");
+        for (int c=c0;c<c1;c++) printf("-");
+        printf("+\n");
+        for (int r=r0; r<r1; r++) {
+            printf("%2d|",r);
+            for (int c=c0; c<c1; c++) printf("%c",disp[r][c]);
+            printf("|\n");
+        }
+        printf("  +");
+        for (int c=c0;c<c1;c++) printf("-");
+        printf("+\n");
+    } else {
+        /* Full 70x70 map – print every cell */
+        printf("\n  Full 70×70 battlefield map:\n");
+        printf("  +");
+        for (int c=0;c<GRID_N;c++) printf("-");
+        printf("+\n");
+        for (int r=0; r<GRID_N; r++) {
+            printf("%2d|",r);
+            for (int c=0; c<GRID_N; c++) printf("%c",disp[r][c]);
+            printf("|\n");
+        }
+        printf("  +");
+        for (int c=0;c<GRID_N;c++) printf("-");
+        printf("+\n");
+    }
+    printf("  Legend:  S=Start  G=Goal  *=Path  #=Obstacle  .=Free\n");
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Print MoE report
+ * ═══════════════════════════════════════════════════════════ */
+static void print_moe(const MoE *m, const char *label, double density)
+{
+    printf("\n");
+    printf("┌──────────────────────────────────────────────────────┐\n");
+    printf("│  MEASURES OF EFFECTIVENESS  %-25s│\n", label);
+    printf("├──────────────────────────────────────────────────────┤\n");
+    printf("│  Obstacle Density         : %.0f%%                      │\n",
+           density * 100);
+    printf("│  Path Length (km)         : %8.2f km               │\n",
+           m->path_length_km);
+    printf("│  Straight-line Dist (km)  : %8.2f km               │\n",
+           m->straightline_km);
+    printf("│  Straightness Ratio       : %8.4f (1.0 = ideal)    │\n",
+           m->straightness_ratio);
+    printf("│  Path Length (cells)      : %8d                   │\n",
+           m->path_length_cells);
+    printf("│  Nodes Expanded           : %8d                   │\n",
+           m->nodes_expanded);
+    printf("│  Nodes Generated          : %8d                   │\n",
+           m->nodes_generated);
+    printf("│  Effective Branching ≈    : %8.4f                  │\n",
+           m->effective_branching);
+    printf("│  Obstacle Avoidance Evts  : %8d                   │\n",
+           m->obstacle_avoidance_events);
+    printf("│  CPU Time (ms)            : %8.3f ms               │\n",
+           m->cpu_time_ms);
+    printf("│  Memory (node array, KB)  : %8.2f KB               │\n",
+           m->memory_kb);
+    printf("└──────────────────────────────────────────────────────┘\n");
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Print path coordinates
+ * ═══════════════════════════════════════════════════════════ */
+static void print_path_coords(int path_len)
+{
+    printf("\n  Path waypoints (row, col) [km coordinates]:\n  ");
+    for (int i = 0; i < path_len; i++) {
+        printf("(%2d,%2d)", row(path_buf[i]), col(path_buf[i]));
+        if (i < path_len-1) printf(" → ");
+        if ((i+1) % 6 == 0) printf("\n  ");
+    }
+    printf("\n");
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Run one scenario
+ * ═══════════════════════════════════════════════════════════ */
+static void run_scenario(const char *label, double density,
+                         int sr, int sc, int gr, int gc,
+                         unsigned int seed, int show_full_map)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║  SCENARIO: %-42s║\n", label);
+    printf("║  Start: (%2d,%2d)  Goal: (%2d,%2d)  Seed: %-10u    ║\n",
+           sr, sc, gr, gc, seed);
+    printf("╚══════════════════════════════════════════════════════╝\n");
+
+    generate_obstacles(density, sr, sc, gr, gc, seed);
+
+    clock_t t0 = clock();
+    MoE moe;
+    int found = astar(sr, sc, gr, gc, &moe);
+    clock_t t1 = clock();
+
+    if (!found) {
+        printf("\n  [!] No path found – goal unreachable with this obstacle field.\n");
+        printf("      Try a lower density or a different seed.\n");
+        return;
+    }
+
+    int plen = reconstruct_path(idx(gr,gc));
+    compute_moe(sr, sc, gr, gc, plen, &moe, t0, t1);
+    print_moe(&moe, label, density);
+    render_map(sr, sc, gr, gc, plen, show_full_map);
+    print_path_coords(plen);
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Main
+ * ═══════════════════════════════════════════════════════════ */
+int main(void)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║        UGV BATTLEFIELD PATH PLANNER                  ║\n");
+    printf("║   Algorithm : A* (Uniform-Cost + Octile Heuristic)   ║\n");
+    printf("║   Grid      : 70 × 70 km  (8-directional movement)   ║\n");
+    printf("║   Obstacle  : Three density levels                   ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n");
+
+    /*  Three scenarios: same start/goal, three obstacle densities.
+     *  Start = (5,5), Goal = (64,64) — near opposite corners
+     *  of the 70×70 battlefield.
+     */
+    int SR = 5,  SC = 5;
+    int GR = 64, GC = 64;
+    unsigned int BASE_SEED = 42;
+
+    /* LOW density – full map shown */
+    run_scenario("LOW DENSITY  (10% obstacles)",
+                 DENSITY_LOW, SR, SC, GR, GC, BASE_SEED, 0);
+
+    /* MEDIUM density */
+    run_scenario("MEDIUM DENSITY  (25% obstacles)",
+                 DENSITY_MEDIUM, SR, SC, GR, GC, BASE_SEED + 1, 0);
+
+    /* HIGH density */
+    run_scenario("HIGH DENSITY  (40% obstacles)",
+                 DENSITY_HIGH, SR, SC, GR, GC, BASE_SEED + 2, 0);
+
+    /* ── Interactive query ─────────────────────────────────
+     *  Uncomment below to let the user enter custom inputs.
+     * ────────────────────────────────────────────────────── */
+#if 0
+    {
+        int sr,sc,gr,gc; double dens; unsigned int seed;
+        printf("\n--- Custom Run ---\n");
+        printf("Start row col (0-%d): ", GRID_N-1); scanf("%d %d",&sr,&sc);
+        printf("Goal  row col (0-%d): ", GRID_N-1); scanf("%d %d",&gr,&gc);
+        printf("Density (0.0-0.6)  : "); scanf("%lf",&dens);
+        printf("Random seed        : "); scanf("%u",&seed);
+        run_scenario("USER-DEFINED", dens, sr,sc,gr,gc, seed, 1);
+    }
+#endif
+
+    /* ── Comparative MoE summary ──────────────────────────── */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║  COMPARATIVE ANALYSIS NOTES                          ║\n");
+    printf("╠══════════════════════════════════════════════════════╣\n");
+    printf("║  LOW density  → near-straight path, low node count  ║\n");
+    printf("║  MED density  → moderate detours, higher expansion  ║\n");
+    printf("║  HIGH density → longest path or possible failure     ║\n");
+    printf("║                                                      ║\n");
+    printf("║  A* guarantees OPTIMAL path (h is admissible)        ║\n");
+    printf("║  Octile h never overestimates on 8-dir grids         ║\n");
+    printf("║  Straightness Ratio → 1.0 means perfectly direct     ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n\n");
+
+    return 0;
+}
